@@ -62,6 +62,7 @@ ALTER PROCEDURE [dbo].[DatabaseBackup]
 @Init nvarchar(max) = 'N',
 @DatabaseOrder nvarchar(max) = NULL,
 @DatabasesInParallel nvarchar(max) = 'N',
+@MinBackupAge int = NULL,  -- Do not take a backup when the previous backup (of the same type) is less than x hours old. Skips already backed up databases when rerunning a job after failure.
 @LogToTable nvarchar(max) = 'N',
 @Execute nvarchar(max) = 'Y'
 
@@ -141,6 +142,9 @@ BEGIN
   DECLARE @CurrentLogSizeSinceLastLogBackup float
   DECLARE @CurrentAllocatedExtentPageCount bigint
   DECLARE @CurrentModifiedExtentPageCount bigint
+  DECLARE @TooRecentBackupExists bit
+  DECLARE @MsdbBackupSetType char(1)
+  DECLARE @PreviousBackupDatetime datetime
 
   DECLARE @CurrentCommand01 nvarchar(max)
   DECLARE @CurrentCommand02 nvarchar(max)
@@ -321,6 +325,7 @@ BEGIN
   SET @Parameters = @Parameters + ', @Init = ' + ISNULL('''' + REPLACE(@Init,'''','''''') + '''','NULL')
   SET @Parameters = @Parameters + ', @DatabaseOrder = ' + ISNULL('''' + REPLACE(@DatabaseOrder,'''','''''') + '''','NULL')
   SET @Parameters = @Parameters + ', @DatabasesInParallel = ' + ISNULL('''' + REPLACE(@DatabasesInParallel,'''','''''') + '''','NULL')
+  SET @Parameters = @Parameters + ', @MinBackupAge = '  + ISNULL(CAST(@MinBackupAge AS nvarchar),'NULL')
   SET @Parameters = @Parameters + ', @LogToTable = ' + ISNULL('''' + REPLACE(@LogToTable,'''','''''') + '''','NULL')
   SET @Parameters = @Parameters + ', @Execute = ' + ISNULL('''' + REPLACE(@Execute,'''','''''') + '''','NULL')
 
@@ -1995,6 +2000,23 @@ BEGIN
       EXECUTE sp_executesql @statement = @CurrentCommand06, @params = N'@ParamDatabaseName nvarchar(max), @ParamIsEncrypted bit OUTPUT', @ParamDatabaseName = @CurrentDatabaseName, @ParamIsEncrypted = @CurrentIsEncrypted OUTPUT
     END
 
+    SET @TooRecentBackupExists = 0
+    If(@MinBackupAge IS NOT NULL)
+    BEGIN
+        SET @MsdbBackupSetType = CASE @BackupType 
+                                    WHEN 'FULL' THEN 'D'
+                                    WHEN 'DIFF' THEN 'I'
+                                 -- WHEN 'LOG'  THEN 'L' -- MinBackupAge nly applicable for database backups
+                                 END
+
+        SELECT @TooRecentBackupExists  = 1 
+             , @PreviousBackupDatetime = B.backup_finish_date
+          FROM msdb.dbo.backupset AS B
+         WHERE B.database_name         = @CurrentDatabaseName
+           AND B.type                  = @MsdbBackupSetType
+           AND B.[backup_finish_date]  > DATEADD(HOUR, -@MinBackupAge, SYSDATETIME())
+    END
+
     SET @DatabaseMessage = 'Date and time: ' + CONVERT(nvarchar,GETDATE(),120)
     RAISERROR('%s',10,1,@DatabaseMessage) WITH NOWAIT
 
@@ -2084,6 +2106,16 @@ BEGIN
 
     RAISERROR(@EmptyLine,10,1) WITH NOWAIT
 
+    IF (@MinBackupAge IS NOT NULL AND @TooRecentBackupExists = 1 )
+    BEGIN
+      SET @DatabaseMessage = '--> Skipping database backup because a previous backup exists from ''' + ISNULL(CAST(@PreviousBackupDatetime as nvarchar),'N/A') + ''''
+                           + ' that is more recent than ''' +  CAST(DATEADD(HOUR, -@MinBackupAge, GETDATE()) AS nvarchar) + ''''
+                           + ' as specified by parameter @MinBackupAge=' + ISNULL(CAST(@MinBackupAge AS nvarchar),'N/A') + ' (hours).'
+      RAISERROR(@DatabaseMessage,10,1) WITH NOWAIT
+    END 
+
+    RAISERROR('',10,1) WITH NOWAIT
+
     IF DATABASEPROPERTYEX(@CurrentDatabaseName,'Status') = 'ONLINE'
     AND (@CurrentIsDatabaseAccessible = 1 OR @CurrentIsDatabaseAccessible IS NULL)
     AND DATABASEPROPERTYEX(@CurrentDatabaseName,'IsInStandBy') = 0
@@ -2099,6 +2131,7 @@ BEGIN
     AND NOT (@CurrentIsReadOnly = 1 AND @Updateability = 'READ_WRITE')
     AND NOT (@CurrentIsReadOnly = 0 AND @Updateability = 'READ_ONLY')
     AND NOT (@CurrentBackupType = 'LOG' AND @LogSizeSinceLastLogBackup IS NOT NULL AND @TimeSinceLastLogBackup IS NOT NULL AND NOT(@CurrentLogSizeSinceLastLogBackup >= @LogSizeSinceLastLogBackup OR @CurrentLogSizeSinceLastLogBackup IS NULL OR DATEDIFF(SECOND,@CurrentLastLogBackup,GETDATE()) >= @TimeSinceLastLogBackup OR @CurrentLastLogBackup IS NULL))
+    AND NOT (@MinBackupAge IS NOT NULL AND @TooRecentBackupExists = 1 )
     BEGIN
 
       IF @CurrentBackupType = 'LOG' AND (@CleanupTime IS NOT NULL OR @MirrorCleanupTime IS NOT NULL)
